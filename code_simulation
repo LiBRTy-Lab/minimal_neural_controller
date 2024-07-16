@@ -1,0 +1,381 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import csv
+import lightgbm as lgb
+
+
+from catboost import CatBoostClassifier
+from random import randint
+
+from keras.models import Sequential
+from keras.layers import Dense, Activation
+from keras.optimizers import SGD
+from keras.utils.vis_utils import plot_model
+
+from sklearn.neural_network import MLPRegressor
+from sklearn.datasets import make_regression
+from sklearn import preprocessing
+
+from scipy.interpolate import InterpolatedUnivariateSpline
+
+def save_data(filename,new_bdd):
+    with open(filename, "w", newline="", encoding = "utf-8") as csvfile:
+        writer = csv.writer(csvfile, delimiter=",")
+        for i in range(0,np.size(new_bdd,0)):
+            writer.writerow(new_bdd[i,:])   
+
+
+
+class ModelDyna():
+    def __init__(self):
+        self.frc = np.zeros([3,3])
+        self.trq = np.zeros([3,3])
+        self.g = np.array([[0],[0],[-9.81]])
+        self.dpt = np.array([[-0.1, -0.1],
+                            [0, 0],
+                            [0, 0]])
+        self.l = np.array([[-0.05,-0.05,-0.05],
+                           [0,0,0],
+                           [0,0,0]])
+        self.m = 1*np.array([0.2, 0.2, 0.2])
+        self.In = 1*np.array([[0.01, 0.01, 0.01],
+                               [0, 0, 0],
+                               [0, 0, 0],
+                               [0, 0, 0],
+                               [0.01, 0.01, 0.01],
+                               [0, 0, 0],
+                               [0, 0, 0],
+                               [0, 0, 0],
+                               [0.01, 0.01, 0.01]])
+
+        self.q = np.zeros([3,1])
+        self.qd = np.zeros([3,1])
+        self.qdd = np.zeros([3,1])
+        self.Q = np.zeros([3,1])
+
+        self.P = 20
+        self.I = 0
+        self.D = 1000
+
+        self.Jm = 0.1*np.diag([0.1, 0.1, 0.1]);
+        self.Dm = 0.*np.diag([1, 1, 1]);
+        self.R = np.diag([1, 1, 1]);
+
+    def dirdyn(self):
+
+        self.M = np.zeros([3,3]);
+        self.c = np.zeros([3,1]);
+
+        q = self.q;
+        qd = self.qd;
+        qdd = self.qdd;
+
+        frc = self.frc;
+        trq = self.trq;
+
+        dpt = self.dpt;
+        l = self.l;
+
+        m = self.m;
+        In = self.In;
+
+        g = self.g;
+
+        c = np.zeros([3,1])
+        M = np.zeros([3,3])
+         
+        # Trigonometric functions
+
+        S1 = np.sin(q[0]);
+        C1 = np.cos(q[0]);
+        S2 = np.sin(q[1]);
+        C2 = np.cos(q[1]);
+        S3 = np.sin(q[2]);
+        C3 = np.cos(q[2]);
+         
+        # Forward Kinematics
+
+        BS11 = -qd[0]*qd[0];
+        AF11 = g[2]*S1;
+        AF31 = -g[2]*C1;
+        OM22 = qd[0]+qd[1];
+        BS12 = -OM22*OM22;
+        AF12 = -AF31*S2+C2*(AF11+BS11*dpt[0,0]);
+        AF32 = AF31*C2+S2*(AF11+BS11*dpt[0,0]);
+        AM12_1 = dpt[0,0]*S2;
+        AM32_1 = -dpt[0,0]*C2;
+        OM23 = qd[2]+OM22;
+        BS13 = -OM23*OM23;
+        AF13 = -AF32*S3+C3*(AF12+BS12*dpt[0,1]);
+        AF33 = AF32*C3+S3*(AF12+BS12*dpt[0,1]);
+        AM13_1 = AM12_1*C3-S3*(AM32_1-dpt[0,1]);
+        AM33_1 = AM12_1*S3+C3*(AM32_1-dpt[0,1]);
+        AM13_2 = dpt[0,1]*S3;
+        AM33_2 = -dpt[0,1]*C3;
+         
+        # Backward Dynamics
+
+        FA13 = -frc[0,2]+m[2]*(AF13+BS13*l[0,2]);
+        FA33 = -frc[2,2]+m[2]*AF33;
+        CF23 = -trq[1,2]-FA33*l[0,2];
+        FB13_1 = m[2]*AM13_1;
+        FB33_1 = m[2]*(AM33_1-l[0,2]);
+        CM23_1 = In[4,2]-FB33_1*l[0,2];
+        FB13_2 = m[2]*AM13_2;
+        FB33_2 = m[2]*(AM33_2-l[0,2]);
+        CM23_2 = In[4,2]-FB33_2*l[0,2];
+        FB33_3 = -m[2]*l[0,2];
+        CM23_3 = In[4,2]-FB33_3*l[0,2];
+        FA12 = -frc[0,1]+m[1]*(AF12+BS12*l[0,1]);
+        FA32 = -frc[2,1]+m[1]*AF32;
+        FF12 = FA12+FA13*C3+FA33*S3;
+        FF32 = FA32-FA13*S3+FA33*C3;
+        CF22 = -trq[1,1]+CF23-FA32*l[0,1]-dpt[0,1]*(-FA13*S3+FA33*C3);
+        FB12_1 = m[1]*AM12_1;
+        FB32_1 = m[1]*(AM32_1-l[0,1]);
+        FM12_1 = FB12_1+FB13_1*C3+FB33_1*S3;
+        FM32_1 = FB32_1-FB13_1*S3+FB33_1*C3;
+        CM22_1 = In[4,1]+CM23_1-FB32_1*l[0,1]-dpt[0,1]*(-FB13_1*S3+FB33_1*C3);
+        FB32_2 = -m[1]*l[0,1];
+        CM22_2 = In[4,1]+CM23_2-FB32_2*l[0,1]-dpt[0,1]*(-FB13_2*S3+FB33_2*C3);
+        FA31 = -frc[2,0]+m[0]*AF31;
+        CF21 = -trq[1,0]+CF22-FA31*l[0,0]-dpt[0,0]*(-FF12*S2+FF32*C2);
+        FB31_1 = -m[0]*l[0,0];
+        CM21_1 = In[4,0]+CM22_1-FB31_1*l[0,0]-dpt[0,0]*(-FM12_1*S2+FM32_1*C2);
+         
+        # Symbolic model output
+
+        c[0] = CF21;
+        c[1] = CF22;
+        c[2] = CF23;
+        M[0,0] = CM21_1;
+        M[0,1] = CM22_1;
+        M[0,2] = CM23_1;
+        M[1,0] = CM22_1;
+        M[1,1] = CM22_2;
+        M[1,2] = CM23_2;
+        M[2,0] = CM23_1;
+        M[2,1] = CM23_2;
+        M[2,2] = CM23_3;
+
+        self.M = M
+        self.c = c
+        
+
+def construire_dataset():
+    global Y1, Y2, Y3, X1, X2, X3, Y1test, Y2test, Y3test, X1test, X2test, X3test, Xall, Yall, Xalltest, Yalltest, dataset, dataset_inter_1
+    Y1 = dataset_inter_1.iloc[0:nb_trajectories_training*100, 4]
+    Y2 = dataset_inter_1.iloc[0:nb_trajectories_training*100, 9]
+    Y3 = dataset_inter_1.iloc[0:nb_trajectories_training*100, 14]
+
+    X1 = dataset_inter_1.iloc[0:nb_trajectories_training*100, 0:4]
+    X2 = dataset_inter_1.iloc[0:nb_trajectories_training*100, 5:9]
+    X3 = dataset_inter_1.iloc[0:nb_trajectories_training*100, 10:14]
+
+    Y1test = dataset.iloc[-nb_trajectories_test*100:, 4]
+    Y2test = dataset.iloc[-nb_trajectories_test*100:, 9]
+    Y3test = dataset.iloc[-nb_trajectories_test*100:, 14]
+
+    X1test = dataset.iloc[-nb_trajectories_test*100:, 0:4]
+    X2test = dataset.iloc[-nb_trajectories_test*100:, 5:9]
+    X3test = dataset.iloc[-nb_trajectories_test*100:, 10:14]
+
+    Xall = np.concatenate([X1,X2,X3], axis=1)
+    Yall = np.concatenate([np.expand_dims(Y1, axis=1),np.expand_dims(Y2, axis=1),np.expand_dims(Y3, axis=1)], axis=1)
+    Xalltest = np.concatenate([X1test,X2test,X3test], axis=1)
+    Yalltest = np.concatenate([np.expand_dims(Y1test, axis=1),np.expand_dims(Y2test, axis=1),
+                               np.expand_dims(Y3test, axis=1)], axis=1)
+
+def prepare_trajectory():
+    global dynamic_model, predict_command, command_traj
+    dynamic_model = ModelDyna()
+    ma_traj = np.concatenate([Yalltest[100*num_traj:100*(num_traj+1)],np.zeros([1,3])], axis=0)
+    ma_deriv = np.zeros([101,3])
+
+    for i in range(0,3):
+        mySpline=InterpolatedUnivariateSpline(np.linspace(0,1,101),ma_traj[:,i],k=3)
+        myDeriv=mySpline.derivative()
+        ma_deriv[:,i] = myDeriv(np.linspace(0,1,101))
+
+    data_to_nn = np.concatenate([ma_traj[0:100,0], ma_deriv[0:100,0], ma_traj[1:101,0], ma_deriv[1:101,0], \
+                                 ma_traj[0:100,1], ma_deriv[0:100,1], ma_traj[1:101,1], ma_deriv[1:101,1], \
+                                 ma_traj[0:100,2], ma_deriv[0:100,2], ma_traj[1:101,2], ma_deriv[1:101,2]], axis=0)
+
+##    data_to_nn = np.concatenate([ma_traj[0:100,0], np.concatenate([[0], (ma_traj[2:101,0]-ma_traj[0:99,0])/2*100]), \
+##                                ma_traj[1:101,0], np.concatenate([(ma_traj[2:101,0]-ma_traj[0:99,0])/2*100, [0]]), \
+##                                 ma_traj[0:100,1], np.concatenate([[0], (ma_traj[2:101,1]-ma_traj[0:99,1])/2*100]), \
+##                                ma_traj[1:101,1], np.concatenate([(ma_traj[2:101,1]-ma_traj[0:99,1])/2*100, [0]]), \
+##                                 ma_traj[0:100,2], np.concatenate([[0], (ma_traj[2:101,2]-ma_traj[0:99,2])/2*100]), \
+##                                ma_traj[1:101,2], np.concatenate([(ma_traj[2:101,2]-ma_traj[0:99,2])/2*100, [0]])], axis=0)
+
+    data_to_nn = np.reshape(data_to_nn, [12,100]).T
+
+    if nn_method == "nn_for_each":
+        predict_command_1 = net_motor_1.predict(data_to_nn[:,0:4])
+        predict_command_1 = np.expand_dims(predict_command_1, axis=1)
+        predict_command_2 = net_motor_2.predict(data_to_nn[:,4:8])
+        predict_command_2 = np.expand_dims(predict_command_2, axis=1)
+        predict_command_3 = net_motor_3.predict(data_to_nn[:,8:12])
+        predict_command_3 = np.expand_dims(predict_command_3, axis=1)
+        predict_command = np.concatenate([predict_command_1,predict_command_2,predict_command_3], axis=1)
+
+    else:
+        predict_command = net_all_motors.predict(data_to_nn)
+    
+    command_traj = np.repeat(predict_command, int(1/steptime/100), axis=0)
+
+
+
+def execute_traj():
+    global dynamic_model, traj_exec_q, traj_exec_qd, new_bdd, command_traj_for_save, traj_desired
+    traj_exec_q = np.zeros([int(1/steptime)+1,3])
+    traj_exec_qd = np.zeros([int(1/steptime)+1,3])
+
+    for num_step in range(0,int(1/steptime)):
+        traj_exec_q[num_step, :] = np.transpose(dynamic_model.q)
+        traj_exec_qd[num_step, :] = np.transpose(dynamic_model.qd)
+        dynamic_model.dirdyn()
+        dynamic_model.Q[0] = (command_traj[num_step,0]-dynamic_model.q[0])*dynamic_model.P + \
+                            ((command_traj[num_step,0]-command_traj[max(num_step-1,0),0])- \
+                             (dynamic_model.q[0]-traj_exec_q[max(num_step-1,0),0]))*dynamic_model.D
+        dynamic_model.Q[1] = (command_traj[num_step,1]-dynamic_model.q[1])*dynamic_model.P + \
+                            ((command_traj[num_step,1]-command_traj[max(num_step-1,0),1])- \
+                             (dynamic_model.q[1]-traj_exec_q[max(num_step-1,0),1]))*dynamic_model.D
+        dynamic_model.Q[2] = (command_traj[num_step,2]-dynamic_model.q[2])*dynamic_model.P + \
+                            ((command_traj[num_step,2]-command_traj[max(num_step-1,0),2])- \
+                             (dynamic_model.q[2]-traj_exec_q[max(num_step-1,0),2]))*dynamic_model.D
+
+        #dynamic_model.qdd = np.linalg.inv(dynamic_model.M).dot((dynamic_model.Q - dynamic_model.c))
+
+        print(dynamic_model.Jm)
+        print(dynamic_model.R.dot(dynamic_model.M).dot(dynamic_model.R))
+        invJRMR = np.linalg.inv(dynamic_model.Jm + dynamic_model.R.dot(dynamic_model.M).dot(dynamic_model.R))
+        QRcDmqd = dynamic_model.Q - dynamic_model.R.dot(dynamic_model.c) - dynamic_model.Dm.dot(dynamic_model.qd)
+        dynamic_model.qdd = dynamic_model.R.dot(invJRMR.dot(QRcDmqd))
+
+        dynamic_model.q = dynamic_model.q + dynamic_model.qd*steptime
+        dynamic_model.qd = dynamic_model.qd + dynamic_model.qdd*steptime
+
+        
+    traj_exec_q = traj_exec_q[0:-1:int(1/steptime/100)]
+    traj_exec_qd = traj_exec_qd[0:-1:int(1/steptime/100)]
+    command_traj_for_save = command_traj[0:-1:int(1/steptime/100)]
+    sauvegarde_dans_bdd()
+
+
+def sauvegarde_dans_bdd():
+    global traj_exec_q, traj_exec_qd, new_bdd, command_traj_for_save
+    new_data = np.column_stack((traj_exec_q[0:98,0], traj_exec_qd[0:98,0], traj_exec_q[1:99,0], traj_exec_qd[1:99,0], command_traj_for_save[0:98,0], \
+                               traj_exec_q[0:98,1], traj_exec_qd[0:98,1], traj_exec_q[1:99,1], traj_exec_qd[1:99,1], command_traj_for_save[0:98,1], \
+                               traj_exec_q[0:98,2], traj_exec_qd[0:98,2], traj_exec_q[1:99,2], traj_exec_qd[1:99,2], command_traj_for_save[0:98,2], \
+                               ))
+
+    if np.size(new_bdd) == 1:
+        new_bdd = new_data
+    else:
+        new_bdd = np.concatenate((new_bdd, new_data), axis=0)
+
+#dataset = pd.read_csv("Resultats/Tests_complets/in0_g0/bdd.csv", delimiter=",", header=None)
+dataset = pd.read_csv("bdd.csv", delimiter=",", header=None)
+dataset_inter_1 = pd.read_csv("bdd.csv", delimiter=",", header=None)
+
+#normalized_df=(dataset-dataset.mean())/dataset.std()
+
+
+list_nb_trajectories_training = [
+    900,# 10, 50, 100, 175, 250, 400, 700, 
+    1, 2, 5, 10, 20, 30, 40, 50, 75, 100, 125, 150, 175, 200, 250, 300, 350, 400, 500, 600, 700, 
+    #1, 2, 5, 10, 15, 20, 30, 50, 70, 100, 150, 200, 300, 500, 750, 1000, 1500,
+    #2000, 5000,#2000, 3000, 5000, #7000,
+    #9500,
+]
+nb_trajectories_test = 30
+nn_method = "nn_for_all"
+check_method = "traj"
+steptime = 0.01
+list_taille_nn = [[16]]#[[1], [3], [16], [3, 3], [16, 16], [16, 16, 16]]
+##list_taille_nn = [[1], [2], [3], [4], [8], [16], [2, 2], [3, 3], [4, 4], [8, 8], [16, 16],\
+##                  [4, 4, 4], [8, 8, 8], [16, 16, 16], [32, 32, 32]]
+
+save_all_results = []
+compteur_save = 0
+new_bdd = np.zeros([1])
+
+
+# parametre : taille_nn et nb_traj_train
+##class Configuration():
+##    def __init__(self, nn_method, taille_nn, nb_trajectories_training, X1, X2, X3, Y1, Y2, Y3, Xall, Yall):
+##        self.nn_method = nn_method
+##        self.nb_trajectories_training = nb_trajectories_training
+##        self.taille_nn = taille_nn
+##        self.net_motor_1 = MLPRegressor(hidden_layer_sizes=taille_nn, max_iter=500).fit(X1, Y1)
+##        self.net_motor_2 = MLPRegressor(hidden_layer_sizes=taille_nn, max_iter=500).fit(X2, Y2)        
+##        self.net_motor_3 = MLPRegressor(hidden_layer_sizes=taille_nn, max_iter=500).fit(X3, Y3)
+##        self.net_all_motors = MLPRegressor(hidden_layer_sizes=taille_nn, max_iter=500).fit(Xall, Yall)
+##
+##list_configurations = []
+##for taille_nn in list_taille_nn:
+##    print(taille_nn)
+##    for nb_trajectories_training in list_nb_trajectories_training:
+##        print(nb_trajectories_training)
+##        for nn_method in ["nn_for_each"]:
+##            construire_dataset()
+##            list_configurations.append(Configuration(nn_method, taille_nn, nb_trajectories_training, X1, X2, X3, Y1, Y2, Y3, Xall, Yall))
+        
+
+    
+
+for taille_nn in list_taille_nn:
+
+    list_results = []
+    reference_results = 0
+    finished = False
+    print("configuration_nn : ", taille_nn)
+    nb_20 = 1000
+    nb_10 = 1000
+    nb_100 = 1000
+    for nb_trajectories_training in list_nb_trajectories_training:
+        
+        if finished == False:
+            print(nb_trajectories_training, " trajectories for training")
+            construire_dataset()
+            if nn_method == "nn_for_each":
+                net_motor_1 = MLPRegressor(hidden_layer_sizes=taille_nn, max_iter=5000).fit(X1, Y1)
+                net_motor_2 = MLPRegressor(hidden_layer_sizes=taille_nn, max_iter=5000).fit(X2, Y2)        
+                net_motor_3 = MLPRegressor(hidden_layer_sizes=taille_nn, max_iter=5000).fit(X3, Y3)
+            else:
+                net_all_motors = MLPRegressor(hidden_layer_sizes=taille_nn, max_iter=5000).fit(Xall, Yall)
+
+            save_traj_exec = np.zeros([100*nb_trajectories_test,3])
+
+            for num_traj in range(0,nb_trajectories_test):
+                prepare_trajectory()
+                traj_desired = Yalltest[100*num_traj:100*(num_traj+1),:]
+                execute_traj()
+                
+                
+                save_traj_exec[100*num_traj:100*(num_traj+1),:] = traj_exec_q
+
+            rms_nn_each_traj = np.sqrt(np.mean((save_traj_exec - Yalltest[0:100*nb_trajectories_test])**2, axis=0))
+            print("Performance petits nn : ", rms_nn_each_traj, mean(rms_nn_each_traj))
+            list_results.append(rms_nn_each_traj)
+            if reference_results == 0:
+                reference_results = np.mean(rms_nn_each_traj)
+            else:
+                if np.mean(rms_nn_each_traj) < 2*reference_results:
+                    nb_100 = min(nb_100, nb_trajectories_training)
+                if np.mean(rms_nn_each_traj) < 1.2*reference_results:
+                    nb_20 = min(nb_20, nb_trajectories_training)
+                if np.mean(rms_nn_each_traj) < 1.1*reference_results:
+                    nb_10 = min(nb_10, nb_trajectories_training)
+                if np.mean(rms_nn_each_traj) < 1.05*reference_results or nb_trajectories_training==700:
+                    #finished = True
+                    save_all_results.append([taille_nn, reference_results, nb_trajectories_training, nb_100, nb_20, nb_10])
+
+    #save_all_results.append(list_results)
+
+rms_pid_traj = np.sqrt(np.mean((Xalltest[0:3000, [0, 4, 8]] - Yalltest[0:3000])**2, axis=0))
+print("Performance PID : ", rms_pid_traj)
+
+#save_data("new_bdd.csv",new_bdd)
